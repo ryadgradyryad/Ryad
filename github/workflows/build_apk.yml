@@ -1,0 +1,423 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:bip39/bip39.dart' as bip39;
+import 'package:web3dart/web3dart.dart';
+import 'package:http/http.dart' as http;
+import 'package:qr_flutter/qr_flutter.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const TrustCloneApp());
+}
+
+// ---------------------------------------------------------------------------
+// 1. نظام التخزين المشفر في الهاتف
+// ---------------------------------------------------------------------------
+class SecureVault {
+  static const _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+  );
+
+  static Future<void> saveMnemonic(String mnemonic) async =>
+      await _storage.write(key: 'vault_mnemonic', value: mnemonic);
+
+  static Future<String?> getMnemonic() async =>
+      await _storage.read(key: 'vault_mnemonic');
+
+  static Future<void> clearVault() async =>
+      await _storage.deleteAll();
+}
+
+// ---------------------------------------------------------------------------
+// 2. محرك البلوكشين والعمليات (Web3 Engine)
+// ---------------------------------------------------------------------------
+class Web3Engine {
+  static const String rpcUrl = "https://rpc2.sepolia.org";
+  late Web3Client client;
+
+  Web3Engine() {
+    client = Web3Client(rpcUrl, http.Client());
+  }
+
+  String createNewMnemonic() => bip39.generateMnemonic();
+
+  EthPrivateKey getPrivateKey(String mnemonic) {
+    final seed = bip39.mnemonicToSeed(mnemonic);
+    final privateKeyBytes = seed.sublist(0, 32);
+    final hexKey = privateKeyBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return EthPrivateKey.fromHex(hexKey);
+  }
+
+  Future<String> fetchBalance(EthereumAddress address) async {
+    try {
+      final balance = await client.getBalance(address);
+      return balance.getValueInUnit(EtherUnit.ether).toStringAsFixed(4);
+    } catch (e) {
+      return "0.0000";
+    }
+  }
+
+  Future<String> transferFunds({
+    required EthPrivateKey privateKey,
+    required String receiverAddress,
+    required double amountEth,
+  }) async {
+    final recipient = EthereumAddress.fromHex(receiverAddress);
+    final amountWei = BigInt.from(amountEth * 1e18);
+
+    final txHash = await client.sendTransaction(
+      privateKey,
+      Transaction(
+        to: recipient,
+        value: EtherAmount.fromUnitAndValue(EtherUnit.wei, amountWei),
+      ),
+      chainId: 11155111,
+    );
+    return txHash;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. التطبيق وواجهة المستخدم (UI)
+// ---------------------------------------------------------------------------
+class TrustCloneApp extends StatelessWidget {
+  const TrustCloneApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Trust Clone',
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0C1017),
+        cardColor: const Color(0xFF161C26),
+        primaryColor: const Color(0xFF0052FF),
+      ),
+      home: const DashboardScreen(),
+    );
+  }
+}
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  final Web3Engine _engine = Web3Engine();
+  String? _mnemonic;
+  EthPrivateKey? _credentials;
+  String _balance = "0.0000";
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStoredWallet();
+  }
+
+  Future<void> _loadStoredWallet() async {
+    final stored = await SecureVault.getMnemonic();
+    if (stored != null) {
+      _activateWallet(stored);
+    }
+  }
+
+  void _activateWallet(String mnemonic) async {
+    setState(() => _loading = true);
+    final creds = _engine.getPrivateKey(mnemonic);
+    await SecureVault.saveMnemonic(mnemonic);
+    final bal = await _engine.fetchBalance(creds.address);
+    setState(() {
+      _mnemonic = mnemonic;
+      _credentials = creds;
+      _balance = bal;
+      _loading = false;
+    });
+  }
+
+  void _generateWallet() {
+    final newMnemonic = _engine.createNewMnemonic();
+    _activateWallet(newMnemonic);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final address = _credentials?.address.hex ?? "";
+
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: const Text("Trust Wallet Alpha", style: TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.blueAccent),
+            onPressed: () {
+              if (_credentials != null) _activateWallet(_mnemonic!);
+            },
+          ),
+          if (_credentials != null)
+            IconButton(
+              icon: const Icon(Icons.logout, color: Colors.redAccent),
+              onPressed: () async {
+                await SecureVault.clearVault();
+                setState(() {
+                  _credentials = null;
+                  _mnemonic = null;
+                  _balance = "0.0000";
+                });
+              },
+            ),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator(color: Colors.blueAccent))
+          : _credentials == null
+              ? _buildWelcomeScreen()
+              : _buildDashboard(address),
+    );
+  }
+
+  Widget _buildWelcomeScreen() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.account_balance_wallet, size: 85, color: Colors.blueAccent),
+            const SizedBox(height: 24),
+            const Text("بوابتك اللامركزية", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            const Text("تحكم بأموالك بنفسك دون أي وسيط مركزي", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
+            const SizedBox(height: 40),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF0052FF),
+                minimumSize: const Size.fromHeight(50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: _generateWallet,
+              child: const Text("إنشاء محفظة جديدة", style: TextStyle(fontSize: 16)),
+            ),
+            const SizedBox(height: 12),
+            TextButton(
+              onPressed: () => _openImportSheet(),
+              child: const Text("لدي محفظة سابقة (استيراد 12 كلمة)", style: TextStyle(color: Colors.blueAccent)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDashboard(String address) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(colors: [Color(0xFF1A2333), Color(0xFF111722)]),
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: Column(
+              children: [
+                const Text("إجمالي الرصيد (Sepolia ETH)", style: TextStyle(color: Colors.grey)),
+                const SizedBox(height: 8),
+                Text("$_balance ETH", style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 14),
+                GestureDetector(
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: address));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("تم نسخ العنوان!")));
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(color: Colors.white.withOpacity(0.06), borderRadius: BorderRadius.circular(20)),
+                    child: Text(
+                      address.length > 10 ? "${address.substring(0, 6)}...${address.substring(address.length - 4)}" : address,
+                      style: const TextStyle(color: Colors.blueAccent, fontSize: 13),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildActionButton(Icons.arrow_upward, "إرسال", () => _openSendSheet()),
+              _buildActionButton(Icons.arrow_downward, "استلام", () => _openReceiveSheet(address)),
+              _buildActionButton(Icons.vpn_key, "المفاتيح", () => _openBackupSheet()),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActionButton(IconData icon, String label, VoidCallback onTap) {
+    return Column(
+      children: [
+        InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(30),
+          child: CircleAvatar(
+            radius: 28,
+            backgroundColor: const Color(0xFF1E2838),
+            child: Icon(icon, color: Colors.blueAccent, size: 26),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(label, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+      ],
+    );
+  }
+
+  void _openReceiveSheet(String address) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      backgroundColor: const Color(0xFF161C26),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("استلام Sepolia ETH", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+              child: QrImageView(data: address, size: 180),
+            ),
+            const SizedBox(height: 16),
+            Text(address, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.copy),
+              label: const Text("نسخ العنوان"),
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: address));
+                Navigator.pop(context);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openSendSheet() {
+    final toCtrl = TextEditingController();
+    final amtCtrl = TextEditingController();
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF161C26),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom, left: 24, right: 24, top: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("إرسال عملات", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            TextField(controller: toCtrl, decoration: const InputDecoration(labelText: "عنوان المستلم (0x...)")),
+            const SizedBox(height: 12),
+            TextField(controller: amtCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "الكمية (ETH)")),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(48), backgroundColor: Colors.blueAccent),
+              onPressed: () async {
+                Navigator.pop(context);
+                setState(() => _loading = true);
+                try {
+                  final hash = await _engine.transferFunds(
+                    privateKey: _credentials!,
+                    receiverAddress: toCtrl.text.trim(),
+                    amountEth: double.parse(amtCtrl.text.trim()),
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("تم بنجاح! Hash: $hash")));
+                  _activateWallet(_mnemonic!);
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("خطأ: $e")));
+                } finally {
+                  setState(() => _loading = false);
+                }
+              },
+              child: const Text("تأكيد العملية"),
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openBackupSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF161C26),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("عبارة الاسترداد الخاصة بك (12 كلمة)", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.amber)),
+              child: Text(_mnemonic ?? "", textAlign: TextAlign.center, style: const TextStyle(fontSize: 15, height: 1.6, color: Colors.amberAccent)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openImportSheet() {
+    final phraseCtrl = TextEditingController();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF161C26),
+      builder: (_) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom, left: 24, right: 24, top: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("استيراد محفظة قديمة", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+            TextField(controller: phraseCtrl, maxLines: 3, decoration: const InputDecoration(hintText: "أدخل الـ 12 كلمة مفصولة بمسافة")),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(48), backgroundColor: Colors.blueAccent),
+              onPressed: () {
+                final phrase = phraseCtrl.text.trim();
+                if (phrase.split(' ').length >= 12) {
+                  Navigator.pop(context);
+                  _activateWallet(phrase);
+                }
+              },
+              child: const Text("استيراد الآن"),
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+}
